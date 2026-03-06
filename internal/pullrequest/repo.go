@@ -1,145 +1,90 @@
-package pullrequest
+package pullreq
 
 import (
-	"backend-task/internal/teams"
-	"backend-task/internal/user"
-	"errors"
-	"slices"
-	"sync"
-	"time"
-)
+	"backend-task/internal/models"
+	"context"
+	"fmt"
 
-var (
-	ERROR_PR_EXISTS    = errors.New("PR id already exists")
-	ERROR_PR_NOT_FOUND = errors.New("resource not found")
-	ERROR_PR_MERGED    = errors.New("cannot reassign on merged PR")
+	"github.com/jackc/pgx/v5"
 )
 
 type PRrepository struct {
-	PullRequests map[string]PullRequest
-	Mtx          sync.RWMutex
+	db  *pgx.Conn
+	ctx context.Context
 }
 
-func NewPrRepo() *PRrepository {
+func NewRepo(conn *pgx.Conn, context context.Context) *PRrepository {
 	return &PRrepository{
-		PullRequests: make(map[string]PullRequest),
-		Mtx:          sync.RWMutex{},
+		db:  conn,
+		ctx: context,
 	}
 }
 
-func (prRepo *PRrepository) CreateNewPR(newPR NewPullRequest, userRepo *user.UsersRepository, teamsRepo *teams.TeamsRepository) (PullRequest, error) {
-	prRepo.Mtx.Lock()
-	defer prRepo.Mtx.Unlock()
+func (repo *PRrepository) GetPullRequest(id string) (*models.PullRequest, error) {
 
-	if _, exist := prRepo.PullRequests[newPR.PullRequestId]; exist {
-		return PullRequest{}, ERROR_PR_EXISTS
+	pr := models.PullRequest{}
+	SQLQuery := `SELECT * FROM pullrequests WHERE id=$1`
+
+	row := repo.db.QueryRow(repo.ctx, SQLQuery, id)
+
+	err := row.Scan(&pr.Id, &pr.Name, &pr.AuthorId, &pr.Status, &pr.AssignedReviewers, &pr.MergedAt)
+	if err != nil {
+		return nil, fmt.Errorf("Error in row.Scan: %w", err)
 	}
 
-	authorTeamName := userRepo.Users[newPR.AuthorId].TeamName
-	reviewersToAssign := make([]string, 0, 2)
-	for _, user := range userRepo.Users {
-		if len(reviewersToAssign) == 2 {
-			break
-		}
-		if user.TeamName == authorTeamName && user.Id != newPR.AuthorId && user.IsActive {
-			reviewersToAssign = append(reviewersToAssign, user.Id)
-			userRepo.ChangeUserStatus(user.Id, false)
-			teamsRepo.ChangeTeamMemberStatus(authorTeamName, user.Id, false)
-		}
-	}
-	userRepo.ChangeUserStatus(newPR.AuthorId, false)
-	teamsRepo.ChangeTeamMemberStatus(authorTeamName, newPR.AuthorId, false)
-
-	pr := PullRequest{
-		Id:                newPR.PullRequestId,
-		Name:              newPR.PullRequstName,
-		AuthorId:          newPR.AuthorId,
-		Status:            OPEN,
-		AssignedReviewers: reviewersToAssign,
-	}
-	prRepo.PullRequests[newPR.PullRequestId] = pr
-	return pr, nil
+	return &pr, nil
 }
 
-func (prRepo *PRrepository) MergePR(pr NewPullRequest, userRepo *user.UsersRepository, teamsRepo *teams.TeamsRepository) (PullRequest, error) {
-	prRepo.Mtx.Lock()
-	defer prRepo.Mtx.Unlock()
-
-	if _, exist := prRepo.PullRequests[pr.PullRequestId]; !exist {
-		return PullRequest{}, ERROR_PR_NOT_FOUND
-	}
-
-	if prRepo.PullRequests[pr.PullRequestId].Status == MERGED {
-		return prRepo.PullRequests[pr.PullRequestId], nil
-	}
-
-	prToMerge := prRepo.PullRequests[pr.PullRequestId]
-	prToMerge.Status = MERGED
-	prToMerge.MergedAt = time.Now()
-	prRepo.PullRequests[pr.PullRequestId] = prToMerge
-
-	for _, userId := range prToMerge.AssignedReviewers {
-		userRepo.ChangeUserStatus(userId, true)
-		teamsRepo.ChangeTeamMemberStatus(userRepo.Users[userId].TeamName, userId, true)
-	}
-	userRepo.ChangeUserStatus(prToMerge.AuthorId, true)
-	teamsRepo.ChangeTeamMemberStatus(userRepo.Users[prToMerge.AuthorId].TeamName, prToMerge.AuthorId, true)
-	return prToMerge, nil
+func (repo *PRrepository) AddPullRequest(newPR models.PullRequest) error {
+	SQLQuery := `INSERT INTO pullrequests(id, name, author_id, status, reviewers_id, merged_at)
+	VALUES($1, $2, $3, $4, $5, $6);`
+	_, err := repo.db.Exec(repo.ctx, SQLQuery, newPR.Id, newPR.Name, newPR.AuthorId, newPR.Status, newPR.AssignedReviewers, newPR.MergedAt)
+	return err
 }
 
-func (prRepo *PRrepository) ReassignUser(pr NewPullRequest, userRepo *user.UsersRepository, teamsRepo *teams.TeamsRepository) (PullRequest, string, error) {
-	prRepo.Mtx.Lock()
-	defer prRepo.Mtx.Unlock()
-
-	if _, exist := prRepo.PullRequests[pr.PullRequestId]; !exist {
-		return PullRequest{}, "", ERROR_PR_NOT_FOUND
-	}
-
-	if val := prRepo.PullRequests[pr.PullRequestId]; val.Status == MERGED {
-		return PullRequest{}, "", ERROR_PR_MERGED
-	}
-
-	prToModify := prRepo.PullRequests[pr.PullRequestId]
-	currentReviewers := prToModify.AssignedReviewers
-	modifiedtReviewers := slices.DeleteFunc(currentReviewers, func(userId string) bool {
-		return userId == pr.OldReviewerId
-	})
-
-	teamName := userRepo.Users[pr.OldReviewerId].TeamName
-	userRepo.ChangeUserStatus(pr.OldReviewerId, true)
-	teamsRepo.ChangeTeamMemberStatus(teamName, pr.OldReviewerId, true)
-
-	var replacedBy string
-	for _, member := range teamsRepo.Teams[teamName].Members {
-		if !slices.Contains(modifiedtReviewers, member.Id) && member.Id != pr.OldReviewerId && member.IsActive {
-			modifiedtReviewers = append(modifiedtReviewers, member.Id)
-			replacedBy = member.Id
-			userRepo.ChangeUserStatus(member.Id, false)
-			teamsRepo.ChangeTeamMemberStatus(teamName, member.Id, false)
-			break
-		}
-	}
-
-	prToModify.AssignedReviewers = modifiedtReviewers
-	prRepo.PullRequests[pr.PullRequestId] = prToModify
-	return prToModify, replacedBy, nil
+func (repo *PRrepository) UpdatePullRequest(id string, pr models.PullRequest) error {
+	SQLQuery := `UPDATE pullrequests 
+	SET name=$2, author_id=$3, status=$4, reviewers_id=$5, merged_at=$6
+	WHERE id=$1;`
+	_, err := repo.db.Exec(repo.ctx, SQLQuery, pr.Id, pr.Name, pr.AuthorId, pr.Status, pr.AssignedReviewers, pr.MergedAt)
+	return err
 }
 
-func (PRrepo *PRrepository) GetUserPRs(userId string, userRepo *user.UsersRepository) ([]PullRequest, error) {
-	userRepo.Mtx.RLock()
-	defer userRepo.Mtx.RUnlock()
+func (repo *PRrepository) DeletePullRequst(id string) error {
+	SQLQuery := `DELETE FROM pullrequests
+	WHERE id=$1`
+	_, err := repo.db.Exec(repo.ctx, SQLQuery, id)
+	return err
+}
 
-	if _, exist := userRepo.Users[userId]; !exist {
-		return []PullRequest{}, teams.ERROR_NOT_FOUND
+func (repo *PRrepository) DeleteReviewerFromPR(prID string, oldReviewerId string) error {
+	SQLQuery := `UPDATE pullrequests
+	SET reviewers_id=ARRAY_REMOVE(reviewers_id, $1)
+	WHERE id=$2`
+	_, err := repo.db.Exec(repo.ctx, SQLQuery, oldReviewerId, prID)
+	return err
+}
+
+func (repo *PRrepository) GetPullRequestsByReviewer(id string) ([]models.PullRequest, error) {
+	prs := make([]models.PullRequest, 0)
+
+	SQLQuery := `SELECT * FROM pullrequests 
+	WHERE $1 = ANY(reviewers_id);`
+
+	rows, err := repo.db.Query(repo.ctx, SQLQuery, id)
+	if err != nil {
+		return nil, err
 	}
 
-	userTasks := make([]PullRequest, 0)
-	for _, pr := range PRrepo.PullRequests {
-		if slices.Contains(pr.AssignedReviewers, userId) || pr.AuthorId == userId {
-			pr.AssignedReviewers = make([]string, 0)
-			userTasks = append(userTasks, pr)
+	for rows.Next() {
+		pr := models.PullRequest{}
+		err = rows.Scan(&pr.Id, &pr.Name, &pr.AuthorId, &pr.Status, &pr.AssignedReviewers, &pr.MergedAt)
+		if err != nil {
+			return nil, err
 		}
+		pr.AssignedReviewers = []string{}
+		prs = append(prs, pr)
 	}
 
-	return userTasks, nil
+	return prs, nil
 }

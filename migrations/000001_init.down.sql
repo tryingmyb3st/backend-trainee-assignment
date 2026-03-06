@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS pullrequests;
+
+DROP TABLE IF EXISTS users;

@@ -1,4 +1,4 @@
-FROM golang:latest
+FROM golang:1.26.0-alpine3.22
 
 WORKDIR /task
 

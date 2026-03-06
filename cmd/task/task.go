@@ -2,26 +2,43 @@ package main
 
 import (
 	"backend-task/internal/handlers"
-	"backend-task/internal/pullrequest"
-	"backend-task/internal/teams"
+	pullreq "backend-task/internal/pullrequest"
+	"backend-task/internal/service"
 	"backend-task/internal/user"
+	"context"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5"
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	router := mux.NewRouter()
-	teamsRepo := teams.NewTeamsRepo()
-	usersRepo := user.NewUsersRepo()
-	prRepo := pullrequest.NewPrRepo()
-	handlers := handlers.Handlers{
-		TeamsRepo: teamsRepo,
-		UsersRepo: usersRepo,
-		PRrepo:    prRepo,
+	if err := godotenv.Load(".env"); err != nil {
+		log.Fatalf("Error with loading config: %s", err)
 	}
 
+	conn, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("No database connection: %s", err)
+	}
+
+	if err = conn.Ping(context.Background()); err != nil {
+		log.Fatalf("Database is not responding: %s", err)
+	}
+
+	usersRepo := user.NewRepo(conn, context.Background())
+	pullreqRepo := pullreq.NewRepo(conn, context.Background())
+
+	serv := service.NewService(pullreqRepo, usersRepo)
+
+	handlers := handlers.Handlers{
+		Serv: serv,
+	}
+
+	router := mux.NewRouter()
 	router.HandleFunc("/team/add", handlers.HandleAddNewTeam).Methods("POST")
 	router.HandleFunc("/team/get", handlers.HandleGetTeam).Queries("team_name", "{team_name}").Methods("GET")
 	router.HandleFunc("/users/setIsActive", handlers.HandleSetIsActiveUser).Methods("POST")
